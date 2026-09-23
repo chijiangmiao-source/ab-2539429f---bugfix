@@ -303,6 +303,86 @@ class TestCostModel:
         assert isinstance(result["summary"]["total_multiplications"], int)
 
 
+class TestMandatoryRootCut:
+    """The masked-subtree-peak case: the unique optimal root cut must be
+    recognized as mandatory even when only a non-minimal-peak frontier
+    record of one side reaches the global optimum."""
+
+    def network(self) -> dict:
+        # T0: e0(3) e3(4) e4(5)   T1: e0(3) e1(5) e5(4)
+        # T2: e1(5) e2(3) e3(4) d6(4)
+        # T3: e2(3) e4(5) e5(4) d7(4) d8(3)
+        return {
+            "tensors": [
+                {"name": "T0", "indices": [
+                    {"name": "e0", "dimension": 3},
+                    {"name": "e3", "dimension": 4},
+                    {"name": "e4", "dimension": 5}]},
+                {"name": "T1", "indices": [
+                    {"name": "e0", "dimension": 3},
+                    {"name": "e1", "dimension": 5},
+                    {"name": "e5", "dimension": 4}]},
+                {"name": "T2", "indices": [
+                    {"name": "e1", "dimension": 5},
+                    {"name": "e2", "dimension": 3},
+                    {"name": "e3", "dimension": 4},
+                    {"name": "d6", "dimension": 4}]},
+                {"name": "T3", "indices": [
+                    {"name": "e2", "dimension": 3},
+                    {"name": "e4", "dimension": 5},
+                    {"name": "e5", "dimension": 4},
+                    {"name": "d7", "dimension": 4},
+                    {"name": "d8", "dimension": 3}]},
+            ]
+        }
+
+    def test_optimum_summary(self):
+        result = plan(self.network())
+        summary = result["summary"]
+        assert summary["peak_memory"] == 720
+        assert summary["total_multiplications"] == 8640
+        assert summary["num_cotrees"] == 1
+        assert summary["canonical"] == "((((T1)(T2))(T0))(T3))"
+
+    def test_unique_mandatory_cut_matches_canonical_root(self):
+        result = plan(self.network())
+        mandatory = [c for c in result["cuts"] if c["classification"] == "mandatory"]
+        optional = [c for c in result["cuts"] if c["classification"] == "optional"]
+        absent = [c for c in result["cuts"] if c["classification"] == "absent"]
+        assert len(mandatory) == 1
+        assert optional == []
+        assert len(absent) == 6
+
+        cut = mandatory[0]
+        sides = {tuple(cut["left"]), tuple(cut["right"])}
+        assert sides == {("T0", "T1", "T2"), ("T3",)}
+        # evidence documents both halves of the dual objective
+        assert "720" in cut["evidence"] and "8640" in cut["evidence"]
+
+        # the last contraction step is exactly that root cut
+        last = result["steps"][-1]
+        assert {tuple(last["left"]), tuple(last["right"])} == sides
+
+    def test_absent_evidence_never_negates_canonical_tree(self):
+        result = plan(self.network())
+        root_left = _tree_leaves(result["tree"]["left"])
+        root_right = _tree_leaves(result["tree"]["right"])
+        for cut in result["cuts"]:
+            partition = {frozenset(cut["left"]), frozenset(cut["right"])}
+            is_canonical_root = partition == {root_left, root_right}
+            if cut["classification"] == "absent":
+                assert not is_canonical_root, (
+                    "canonical root cut must never be classified absent: "
+                    f"{cut['evidence']}"
+                )
+
+
+def _tree_leaves(node: dict) -> frozenset[str]:
+    if node["type"] == "leaf":
+        return frozenset({node["name"]})
+    return _tree_leaves(node["left"]) | _tree_leaves(node["right"])
+
+
 # ---------------------------------------------------------------------------
 # Brute-force cross-checks (random networks)
 # ---------------------------------------------------------------------------
@@ -358,6 +438,16 @@ def test_dp_matches_brute_force(seed):
     }
     assert got_optional_or_mandatory == brute_cuts
 
+    # the canonical tree's own root partition can never be "absent": absent
+    # evidence must never contradict the tree the response itself returns
+    canon_partition = {
+        _tree_names(root.tree[1]),
+        _tree_names(root.tree[2]),
+    }
+    for c in result_cuts:
+        partition = {frozenset(c["left"]), frozenset(c["right"])}
+        assert (c["classification"] != "absent") or (partition != canon_partition)
+
     mandatory = [c for c in result_cuts if c["classification"] == "mandatory"]
     if len(brute_cuts) == 1:
         assert len(mandatory) == 1
@@ -376,6 +466,13 @@ def _mask_of(names, all_names):
         if nm in names:
             m |= 1 << i
     return m
+
+
+def _tree_names(tree: tuple) -> frozenset[str]:
+    """Leaf names on each side of a planner Record tree node."""
+    if tree[0] == "leaf":
+        return frozenset({tree[1]})
+    return _tree_names(tree[1]) | _tree_names(tree[2])
 
 
 def test_canonical_serialization_format():

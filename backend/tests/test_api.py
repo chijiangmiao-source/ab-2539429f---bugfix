@@ -104,6 +104,84 @@ def test_smoke_index_occurring_three_times_is_422_and_located():
     assert err["path"][1] == 0 and err["path"][3] == 0
 
 
+def masked_peak_network() -> dict:
+    """T0(e0,e3,e4) T1(e0,e1,e5) T2(e1,e2,e3,d6) T3(e2,e4,e5,d7,d8)
+    with dims 3,4,5 / 3,5,4 / 5,3,4,4 / 3,5,4,4,3. The unique optimal
+    root cut is {T0,T1,T2} | {T3}, reachable only via a non-minimal-peak
+    frontier record of the left side (its peak is masked by input T3)."""
+    return {
+        "tensors": [
+            {"name": "T0", "indices": [
+                {"name": "e0", "dimension": 3},
+                {"name": "e3", "dimension": 4},
+                {"name": "e4", "dimension": 5}]},
+            {"name": "T1", "indices": [
+                {"name": "e0", "dimension": 3},
+                {"name": "e1", "dimension": 5},
+                {"name": "e5", "dimension": 4}]},
+            {"name": "T2", "indices": [
+                {"name": "e1", "dimension": 5},
+                {"name": "e2", "dimension": 3},
+                {"name": "e3", "dimension": 4},
+                {"name": "d6", "dimension": 4}]},
+            {"name": "T3", "indices": [
+                {"name": "e2", "dimension": 3},
+                {"name": "e4", "dimension": 5},
+                {"name": "e5", "dimension": 4},
+                {"name": "d7", "dimension": 4},
+                {"name": "d8", "dimension": 3}]},
+        ]
+    }
+
+
+def _leaves(node: dict) -> set[str]:
+    if node["type"] == "leaf":
+        return {node["name"]}
+    return _leaves(node["left"]) | _leaves(node["right"])
+
+
+def test_smoke_unique_mandatory_cut_matches_canonical_root():
+    r = client.post("/api/plan", json=masked_peak_network())
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # exact dual-optimum summary
+    summary = body["summary"]
+    assert summary["peak_memory"] == 720
+    assert summary["total_multiplications"] == 8640
+    assert summary["num_cotrees"] == 1
+    assert summary["canonical"] == "((((T1)(T2))(T0))(T3))"
+
+    # leaf sets on the two sides of the canonical tree root
+    root = body["tree"]
+    assert root["type"] == "node"
+    root_partition = {frozenset(_leaves(root["left"])),
+                      frozenset(_leaves(root["right"]))}
+    assert root_partition == {frozenset({"T0", "T1", "T2"}), frozenset({"T3"})}
+
+    by_class = {"mandatory": [], "optional": [], "absent": []}
+    for cut in body["cuts"]:
+        by_class[cut["classification"]].append(cut)
+    assert len(by_class["mandatory"]) == 1
+    assert len(by_class["optional"]) == 0
+    assert len(by_class["absent"]) == 6
+
+    mandatory = by_class["mandatory"][0]
+    assert {frozenset(mandatory["left"]), frozenset(mandatory["right"])} == root_partition
+    assert "720" in mandatory["evidence"] and "8640" in mandatory["evidence"]
+
+    # no absent cut may equal the canonical tree's own root partition:
+    # classification evidence must never negate the returned tree
+    for cut in by_class["absent"]:
+        partition = {frozenset(cut["left"]), frozenset(cut["right"])}
+        assert partition != root_partition, cut["evidence"]
+        assert cut["evidence"]
+
+    # the final contraction step merges the {T0,T1,T2} subtree with T3
+    last = body["steps"][-1]
+    assert {frozenset(last["left"]), frozenset(last["right"])} == root_partition
+
+
 def test_malformed_json_is_400():
     r = client.post("/api/plan", content=b"{not json", headers={"content-type": "application/json"})
     assert r.status_code == 400

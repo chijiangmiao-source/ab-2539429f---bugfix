@@ -51,8 +51,9 @@ services:
       start_period: 5s
 
   # One-shot verification: backend pytest, web production build and a live
-  # API smoke test (four-tensor co-optimal classification + the triple-index
-  # error boundary). Exits 0 on success and a non-zero code on any failure.
+  # API smoke test (four-tensor co-optimal classification, the unique
+  # mandatory-cut case and the triple-index error boundary). Exits 0 on
+  # success and a non-zero code on any failure.
   # Kept under its own profile so `docker compose up` runs only api + web;
   # launch explicitly with `docker compose run --rm verify`.
   verify:

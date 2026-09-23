@@ -46,7 +46,11 @@ either outer peak or outer total). Each frontier entry also carries the
 exact number of distinct canonical tree shapes and the lexicographically
 smallest serialization, which makes the classification and the
 canonical-tree selection exact even when a large outer result masks a
-locally suboptimal subtree peak.
+locally suboptimal subtree peak. Root-cut classification combines the
+full frontiers of *both* sides of each forced cut: a side record with a
+larger local peak (but smaller total) can have that peak masked by a
+tensor on the other side, so pairing only the single best record of each
+side would wrongly mark the canonical tree's own root cut as absent.
 """
 
 from __future__ import annotations
@@ -587,14 +591,40 @@ class Planner:
 
     # -- classification -----------------------------------------------------
 
-    def _cut_outcome(self, a: int, b: int) -> CutOutcome:
-        left_peak, left_total = min(self.table[a])
-        right_peak, right_total = min(self.table[b])
+    def _cut_outcomes(self, a: int, b: int) -> list[CutOutcome]:
+        """Achievable (peak, total) Pareto pairs when the root split is
+        forced to ``a | b``.
+
+        The cross product of *both sides' full Pareto frontiers* must be
+        considered, not the single best record of each side. A side record
+        with a larger local peak but smaller total can have that peak masked
+        by an input tensor or the root result on the other side, in which
+        case it — and only it — reaches the global optimum. A dominated
+        side record can never improve any join, so frontier-only combination
+        is exact."""
         multiplications, result_size = self.split_cost(a, b)
-        return CutOutcome(
-            peak=max(left_peak, right_peak, result_size),
-            total=left_total + right_total + multiplications,
-        )
+        pairs: set[tuple[int, int]] = set()
+        for pa, ta in self.table[a]:
+            for pb, tb in self.table[b]:
+                pairs.add((max(pa, pb, result_size), ta + tb + multiplications))
+        outcomes = [
+            CutOutcome(peak=peak, total=total)
+            for peak, total in self._pareto_pairs(pairs)
+        ]
+        outcomes.sort(key=lambda o: (o.peak, o.total))
+        return outcomes
+
+    @staticmethod
+    def _pareto_pairs(pairs: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
+        """Pareto frontier of (peak, total) pairs: as peak grows, total must
+        strictly improve (decrease) to survive."""
+        kept: list[tuple[int, int]] = []
+        best_total = None
+        for peak, total in sorted(pairs):
+            if best_total is None or total < best_total:
+                kept.append((peak, total))
+                best_total = total
+        return kept
 
     def classify(self, root: Record) -> list[dict]:
         n = self.network.n
@@ -603,9 +633,11 @@ class Planner:
 
         realized: list[int] = []  # root cuts (side containing leaf 0)
         # that can participate in a globally (p_star, t_star)-optimal tree
+        cut_outcomes: dict[int, list[CutOutcome]] = {}
         for a, b in _bipartitions(full):
-            outcome = self._cut_outcome(a, b)
-            if outcome.peak == p_star and outcome.total == t_star:
+            outcomes = self._cut_outcomes(a, b)
+            cut_outcomes[a] = outcomes
+            if any(o.peak == p_star and o.total == t_star for o in outcomes):
                 realized.append(a)
 
         unique_cut = len(realized) == 1
@@ -628,8 +660,9 @@ class Planner:
                 if unique_cut:
                     cls, zh = "mandatory", "必现"
                     evidence = (
-                        f"在峰值 {p_star}、总乘法 {t_star} 的最优目标下，可达最优的根切分"
-                        f"仅此一个，全部同优树的根节点都必现切分 {names_a} | {names_b}"
+                        f"根切分 {names_a} | {names_b} 能够达到双层最优目标"
+                        f"（峰值 {p_star}、总乘法 {t_star}），且没有其他根切分能同时"
+                        f"达到该峰值与总乘法数，故全部同优树的根节点都必现此切分"
                     )
                 else:
                     cls, zh = "optional", "可选"
@@ -640,7 +673,7 @@ class Planner:
                     )
             else:
                 cls, zh = "absent", "不出现"
-                evidence = self._absent_evidence(a, b, p_star, t_star)
+                evidence = self._absent_evidence(a, b, cut_outcomes[a], p_star, t_star)
             result.append(
                 {
                     "left": names_a,
@@ -657,18 +690,26 @@ class Planner:
         return result
 
     def _absent_evidence(
-        self, a: int, b: int, p_star: int, t_star: int
+        self,
+        a: int,
+        b: int,
+        outcomes: list[CutOutcome],
+        p_star: int,
+        t_star: int,
     ) -> str:
-        """Explain why forcing cut a | b cannot reach the optimum."""
+        """Explain why forcing cut a | b cannot reach the optimum.
+
+        ``outcomes`` is the full Pareto frontier achievable when the cut is
+        forced (sorted by peak, then total)."""
         names_a = sorted(self.names_of(a))
         names_b = sorted(self.names_of(b))
-        # lexicographically best achievable pair when forcing this cut
-        outcome = self._cut_outcome(a, b)
-        best_peak = outcome.peak
-        best_total_at_peak = outcome.total
-        min_total_under_star = None  # minimum total with combined peak <= p_star
-        if best_peak <= p_star:
-            min_total_under_star = best_total_at_peak
+        # smallest achievable peak when forcing this cut (a cut whose best
+        # peak exceeds p* is infeasible regardless of total)
+        best_peak = outcomes[0].peak
+        # smallest achievable total among outcomes with peak <= p*
+        min_total_under_star = next(
+            (o.total for o in outcomes if o.peak <= p_star), None
+        )
 
         cut = f"{names_a} | {names_b}"
         if best_peak > p_star:

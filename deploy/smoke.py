@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """Live API smoke checks executed by the one-shot `verify` service.
 
-Two required scenarios are exercised over real HTTP:
+Three required scenarios are exercised over real HTTP:
 
 1. the four-tensor ring: co-optimal root-cut classification must report
    0 mandatory / 6 optional / 1 absent cuts, with the diagonal cut
    (A,C)|(B,D) absent because forcing it builds a size-16 intermediate;
-2. an index occurring three times must be rejected (HTTP 422) with an
+2. a four-tensor network whose unique optimal root cut is reachable only
+   through a non-minimal-peak frontier record of one side (the local peak
+   is masked by an input on the other side): the cut
+   {T0,T1,T2} | {T3} must be the single mandatory cut, identical to the
+   canonical tree root, with the other six cuts absent;
+3. an index occurring three times must be rejected (HTTP 422) with an
    ``index_occurrence`` error carrying a precise JSON path.
 
 Exits 0 only when every assertion holds.
@@ -47,6 +52,38 @@ def ring4() -> dict:
                 {"name": "l", "dimension": 2}, {"name": "i", "dimension": 2}]},
         ]
     }
+
+
+def masked_peak_network() -> dict:
+    return {
+        "tensors": [
+            {"name": "T0", "indices": [
+                {"name": "e0", "dimension": 3},
+                {"name": "e3", "dimension": 4},
+                {"name": "e4", "dimension": 5}]},
+            {"name": "T1", "indices": [
+                {"name": "e0", "dimension": 3},
+                {"name": "e1", "dimension": 5},
+                {"name": "e5", "dimension": 4}]},
+            {"name": "T2", "indices": [
+                {"name": "e1", "dimension": 5},
+                {"name": "e2", "dimension": 3},
+                {"name": "e3", "dimension": 4},
+                {"name": "d6", "dimension": 4}]},
+            {"name": "T3", "indices": [
+                {"name": "e2", "dimension": 3},
+                {"name": "e4", "dimension": 5},
+                {"name": "e5", "dimension": 4},
+                {"name": "d7", "dimension": 4},
+                {"name": "d8", "dimension": 3}]},
+        ]
+    }
+
+
+def _tree_leaves(node: dict) -> frozenset:
+    if node.get("type") == "leaf":
+        return frozenset({node["name"]})
+    return _tree_leaves(node["left"]) | _tree_leaves(node["right"])
 
 
 def bad_three_occurrences() -> dict:
@@ -110,7 +147,78 @@ def main(base: str) -> int:
             f"evidence={absent_cut.get('evidence') if absent_cut else None}",
         )
 
-    # scenario 2: index occurring three times is a located 422
+    # scenario 2: unique mandatory cut reached via a masked higher local peak
+    status, body = _request(base, "POST", "/api/plan", masked_peak_network())
+    ok = status == 200
+    failures += not check("POST /api/plan masked-peak -> 200", ok, f"got {status} {body}")
+    if ok:
+        summary = body["summary"]
+        failures += not check(
+            "masked-peak optimum peak=720 total=8640 cotrees=1",
+            (summary["peak_memory"] == 720
+             and summary["total_multiplications"] == 8640
+             and summary["num_cotrees"] == 1),
+            f"got {summary}",
+        )
+        failures += not check(
+            "canonical tree is ((((T1)(T2))(T0))(T3))",
+            summary["canonical"] == "((((T1)(T2))(T0))(T3))",
+            f"got {summary['canonical']}",
+        )
+
+        root = body["tree"]
+        root_partition = {
+            frozenset(_tree_leaves(root["left"])),
+            frozenset(_tree_leaves(root["right"])),
+        }
+        expected = {frozenset({"T0", "T1", "T2"}), frozenset({"T3"})}
+        failures += not check(
+            "canonical root sides = {T0,T1,T2} | {T3}",
+            root.get("type") == "node" and root_partition == expected,
+            f"got {[sorted(s) for s in root_partition]}",
+        )
+
+        counts = {"mandatory": 0, "optional": 0, "absent": 0}
+        mandatory = None
+        absent_contradicts_root = False
+        for cut in body["cuts"]:
+            counts[cut["classification"]] += 1
+            partition = {frozenset(cut["left"]), frozenset(cut["right"])}
+            if cut["classification"] == "mandatory":
+                mandatory = cut
+            if cut["classification"] == "absent" and partition == root_partition:
+                absent_contradicts_root = True
+        failures += not check(
+            "masked-peak classes: exactly 1 mandatory / 0 optional / 6 absent",
+            counts == {"mandatory": 1, "optional": 0, "absent": 6},
+            f"got {counts}",
+        )
+        mandatory_ok = bool(mandatory) and (
+            {frozenset(mandatory["left"]), frozenset(mandatory["right"])}
+            == root_partition == expected
+        )
+        failures += not check(
+            "the mandatory cut is {T0,T1,T2} | {T3} and matches the tree root",
+            mandatory_ok, f"got {mandatory}",
+        )
+        evidence_ok = bool(mandatory) and "720" in mandatory.get("evidence", "") \
+            and "8640" in mandatory.get("evidence", "")
+        failures += not check(
+            "mandatory-cut evidence cites peak 720 and total 8640",
+            evidence_ok, f"evidence={mandatory.get('evidence') if mandatory else None}",
+        )
+        failures += not check(
+            "no absent-cut evidence negates the canonical tree root",
+            not absent_contradicts_root,
+        )
+        last = body["steps"][-1]
+        last_partition = {frozenset(last["left"]), frozenset(last["right"])}
+        failures += not check(
+            "final contraction step merges {T0,T1,T2} with T3",
+            last_partition == expected, f"got {last}",
+        )
+
+    # scenario 3: index occurring three times is a located 422
     status, body = _request(base, "POST", "/api/plan", bad_three_occurrences())
     ok = status == 422 and any(e.get("code") == "index_occurrence" for e in body.get("errors", []))
     failures += not check("triple index -> HTTP 422 with index_occurrence", ok,
