@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+# One-shot verification image: carries both toolchains so the compose
+# `verify` service can run backend tests, the web production build and a
+# live API smoke test in a single exit-code-reporting container.
+FROM node:20-bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-venv curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /verify
+
+# python deps first (better layer caching)
+COPY backend/requirements.txt backend/requirements-test.txt /verify/backend/
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir \
+        -r /verify/backend/requirements-test.txt
+
+# web deps
+COPY web/package.json web/package-lock.json* /verify/web/
+RUN cd /verify/web && npm install --cache /tmp/npm-cache
+
+# sources
+COPY backend /verify/backend
+COPY web /verify/web
+COPY deploy/smoke.py /verify/smoke.py
+COPY deploy/verify-entrypoint.sh /verify/verify-entrypoint.sh
+
+RUN chmod +x /verify/verify-entrypoint.sh
+
+CMD ["bash", "/verify/verify-entrypoint.sh"]
