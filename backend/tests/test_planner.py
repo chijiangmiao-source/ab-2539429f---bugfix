@@ -36,6 +36,43 @@ def ring4(d: int = 2) -> dict:
     }
 
 
+def masked_peak_network() -> dict:
+    """Four tensors (six shared edges plus three dangling indices) where the
+    unique optimal root split needs a side record whose own peak is not
+    minimal.
+
+    The subset {T0,T1,T2} has two Pareto records: (peak 400, total 6000)
+    and (peak 576, total 5760). Joining it with T3 has a 2880
+    multiplication cost and a size-48 result, while T3 alone is already a
+    size-720 input, so the global optimum (peak 720, total 8640) requires
+    the *higher-peak/lower-total* side record. A classifier that
+    independently minimizes each side of a forced cut wrongly puts total
+    at 8880 and labels the canonical tree's own root cut as absent."""
+    return {
+        "tensors": [
+            {"name": "T0", "indices": [
+                {"name": "e0", "dimension": 3},
+                {"name": "e3", "dimension": 4},
+                {"name": "e4", "dimension": 5}]},
+            {"name": "T1", "indices": [
+                {"name": "e0", "dimension": 3},
+                {"name": "e1", "dimension": 5},
+                {"name": "e5", "dimension": 4}]},
+            {"name": "T2", "indices": [
+                {"name": "e1", "dimension": 5},
+                {"name": "e2", "dimension": 3},
+                {"name": "e3", "dimension": 4},
+                {"name": "d6", "dimension": 4}]},
+            {"name": "T3", "indices": [
+                {"name": "e2", "dimension": 3},
+                {"name": "e4", "dimension": 5},
+                {"name": "e5", "dimension": 4},
+                {"name": "d7", "dimension": 4},
+                {"name": "d8", "dimension": 3}]},
+        ]
+    }
+
+
 def random_network(rng: random.Random, n: int) -> tuple[list[Tensor], dict[str, int]]:
     """Connected random network: spanning tree of binary edges + extra edges
     + dangling indices; 1-6 distinct indices per tensor, each index occurs
@@ -275,6 +312,60 @@ class TestCostModel:
 
         for cut in result["cuts"]:
             assert cut["evidence"]
+
+    def test_masked_subtree_peak_unique_mandatory_root_cut(self):
+        # regression: the canonical tree's own root cut must be mandatory,
+        # not mislabelled absent by independently minimizing each side
+        result = plan(masked_peak_network())
+
+        assert result["summary"]["peak_memory"] == 720
+        assert result["summary"]["total_multiplications"] == 8640
+        assert result["summary"]["canonical"] == "((((T1)(T2))(T0))(T3))"
+        assert result["summary"]["num_cotrees"] == 1
+        assert len(result["steps"]) == 3
+        # the final step merges the {T0,T1,T2} subtree with T3
+        final = result["steps"][-1]
+        assert sorted(final["left"]) == ["T0", "T1", "T2"]
+        assert sorted(final["right"]) == ["T3"]
+
+        counts = {k: sum(1 for c in result["cuts"] if c["classification"] == k)
+                  for k in ("mandatory", "optional", "absent")}
+        assert counts == {"mandatory": 1, "optional": 0, "absent": 6}
+
+        mandatory = next(c for c in result["cuts"] if c["classification"] == "mandatory")
+        assert (sorted(mandatory["left"]), sorted(mandatory["right"])) == (
+            ["T0", "T1", "T2"],
+            ["T3"],
+        )
+        # evidence documents both achieved objective values and uniqueness
+        assert "720" in mandatory["evidence"]
+        assert "8640" in mandatory["evidence"]
+
+        # every absent cut must carry a concrete reason and a strict bound
+        for cut in result["cuts"]:
+            if cut["classification"] == "absent":
+                assert cut["evidence"]
+                assert "8640" in cut["evidence"] or "720" in cut["evidence"]
+
+    def test_root_cut_classification_matches_canonical_tree_root(self):
+        # no absent/optional evidence may ever contradict the response's own
+        # canonical tree: its root split must always be classified mandatory
+        # (unique optimal cut) or optional (one of several)
+        def tree_leaf_sets(node):
+            if node["type"] == "leaf":
+                return {node["name"]}
+            return tree_leaf_sets(node["left"]) | tree_leaf_sets(node["right"])
+
+        result = plan(masked_peak_network())
+        root = result["tree"]
+        left = tree_leaf_sets(root["left"])
+        right = tree_leaf_sets(root["right"])
+        match = next(
+            c for c in result["cuts"]
+            if (set(c["left"]) == left and set(c["right"]) == right)
+            or (set(c["left"]) == right and set(c["right"]) == left)
+        )
+        assert match["classification"] in ("mandatory", "optional")
 
     def test_peak_includes_inputs(self):
         # A with a huge dangling dimension: input size itself dominates peak

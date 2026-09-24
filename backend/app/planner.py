@@ -39,6 +39,12 @@ total):
   tree uses a different cut;
 * absent (不出现): no co-optimal tree uses it.
 
+Whether a forced cut can reach the global optimum is decided by combining
+*both sides' full Pareto frontiers*: independently minimizing each side
+is wrong, because a subtree record with a larger peak but a smaller total
+may have its peak masked by the root join result and still be the record
+required for global total optimality.
+
 A second DP keeps the full Pareto frontier of achievable (peak, total)
 pairs for every leaf subset (a dominated pair can never participate in a
 global optimum — replacing it by the dominating record cannot increase
@@ -341,8 +347,18 @@ class Record:
 
 @dataclass(frozen=True)
 class CutOutcome:
+    """Best achievable result when a particular root cut is forced.
+
+    ``peak``/``total`` are the lexicographically minimum (peak, total)
+    pair over all combinations of the two sides' Pareto records;
+    ``total_under_cap`` is the minimum total attainable while keeping the
+    combined peak at or below the globally optimal peak (None when no
+    combination meets that cap).
+    """
+
     peak: int
     total: int
+    total_under_cap: int | None
 
 
 @dataclass
@@ -587,13 +603,43 @@ class Planner:
 
     # -- classification -----------------------------------------------------
 
-    def _cut_outcome(self, a: int, b: int) -> CutOutcome:
-        left_peak, left_total = min(self.table[a])
-        right_peak, right_total = min(self.table[b])
+    def _forced_cut_outcome(self, a: int, b: int, p_star: int) -> CutOutcome:
+        """Best achievable result when the root split is forced to a | b.
+
+        Both subtrees may independently use *any* record on their Pareto
+        frontiers, so every record pair is combined with the root-join
+        cost. Taking ``min(table[a])`` and ``min(table[b])`` independently
+        would be wrong: a side record with a larger (but still masked by
+        the join result) peak can carry the smaller total that the
+        global optimum requires. Returns:
+
+        * ``min_peak`` — smallest achievable combined peak;
+        * ``total_at_min_peak`` — smallest total at that peak;
+        * ``min_total_under_star`` — smallest total with peak <= p_star,
+          used for the absent-cut "peak is fine but total is too high"
+          evidence (None when no combination meets the peak cap).
+        """
         multiplications, result_size = self.split_cost(a, b)
+        min_peak: int | None = None
+        total_at_min_peak: int | None = None
+        min_total_under_star: int | None = None
+        for pa, ta in self.table[a]:
+            for pb, tb in self.table[b]:
+                peak = max(pa, pb, result_size)
+                total = ta + tb + multiplications
+                if min_peak is None or peak < min_peak or (
+                    peak == min_peak and total < total_at_min_peak
+                ):
+                    min_peak, total_at_min_peak = peak, total
+                if peak <= p_star and (
+                    min_total_under_star is None or total < min_total_under_star
+                ):
+                    min_total_under_star = total
+        assert min_peak is not None and total_at_min_peak is not None
         return CutOutcome(
-            peak=max(left_peak, right_peak, result_size),
-            total=left_total + right_total + multiplications,
+            peak=min_peak,
+            total=total_at_min_peak,
+            total_under_cap=min_total_under_star,
         )
 
     def classify(self, root: Record) -> list[dict]:
@@ -601,10 +647,13 @@ class Planner:
         full = (1 << n) - 1
         p_star, t_star = root.peak, root.total
 
+        # scan every cut once against both sides' full Pareto frontiers
+        outcomes: dict[int, CutOutcome] = {}
         realized: list[int] = []  # root cuts (side containing leaf 0)
         # that can participate in a globally (p_star, t_star)-optimal tree
         for a, b in _bipartitions(full):
-            outcome = self._cut_outcome(a, b)
+            outcome = self._forced_cut_outcome(a, b, p_star)
+            outcomes[a] = outcome
             if outcome.peak == p_star and outcome.total == t_star:
                 realized.append(a)
 
@@ -628,8 +677,9 @@ class Planner:
                 if unique_cut:
                     cls, zh = "mandatory", "必现"
                     evidence = (
-                        f"在峰值 {p_star}、总乘法 {t_star} 的最优目标下，可达最优的根切分"
-                        f"仅此一个，全部同优树的根节点都必现切分 {names_a} | {names_b}"
+                        f"强制根切分 {names_a} | {names_b} 仍可达到双层最优"
+                        f"（峰值 {p_star}、总乘法 {t_star}）；其余根切分均无法同时"
+                        f"达到这两个目标，故全部同优树的根节点都必现此切分"
                     )
                 else:
                     cls, zh = "optional", "可选"
@@ -640,7 +690,7 @@ class Planner:
                     )
             else:
                 cls, zh = "absent", "不出现"
-                evidence = self._absent_evidence(a, b, p_star, t_star)
+                evidence = self._absent_evidence(a, b, p_star, t_star, outcomes[a])
             result.append(
                 {
                     "left": names_a,
@@ -657,25 +707,23 @@ class Planner:
         return result
 
     def _absent_evidence(
-        self, a: int, b: int, p_star: int, t_star: int
+        self,
+        a: int,
+        b: int,
+        p_star: int,
+        t_star: int,
+        outcome: CutOutcome,
     ) -> str:
         """Explain why forcing cut a | b cannot reach the optimum."""
         names_a = sorted(self.names_of(a))
         names_b = sorted(self.names_of(b))
-        # lexicographically best achievable pair when forcing this cut
-        outcome = self._cut_outcome(a, b)
-        best_peak = outcome.peak
-        best_total_at_peak = outcome.total
-        min_total_under_star = None  # minimum total with combined peak <= p_star
-        if best_peak <= p_star:
-            min_total_under_star = best_total_at_peak
-
         cut = f"{names_a} | {names_b}"
-        if best_peak > p_star:
+        if outcome.peak > p_star:
             return (
-                f"若强制根切分 {cut}，峰值至少为 {best_peak}，"
+                f"若强制根切分 {cut}，峰值至少为 {outcome.peak}，"
                 f"高于最优峰值 {p_star}，故无同优树采用"
             )
+        min_total_under_star = outcome.total_under_cap
         if min_total_under_star is not None and min_total_under_star > t_star:
             return (
                 f"若强制根切分 {cut}，在峰值不超过 {p_star} 时总乘法数至少为 "

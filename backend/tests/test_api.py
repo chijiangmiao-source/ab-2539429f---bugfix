@@ -31,6 +31,34 @@ def ring4() -> dict:
     }
 
 
+def masked_peak_network() -> dict:
+    # unique optimal root cut {T0,T1,T2}|{T3} needs a side subtree whose
+    # own peak is Pareto-masked by the root join (see test_planner.py)
+    return {
+        "tensors": [
+            {"name": "T0", "indices": [
+                {"name": "e0", "dimension": 3}, {"name": "e3", "dimension": 4},
+                {"name": "e4", "dimension": 5}]},
+            {"name": "T1", "indices": [
+                {"name": "e0", "dimension": 3}, {"name": "e1", "dimension": 5},
+                {"name": "e5", "dimension": 4}]},
+            {"name": "T2", "indices": [
+                {"name": "e1", "dimension": 5}, {"name": "e2", "dimension": 3},
+                {"name": "e3", "dimension": 4}, {"name": "d6", "dimension": 4}]},
+            {"name": "T3", "indices": [
+                {"name": "e2", "dimension": 3}, {"name": "e4", "dimension": 5},
+                {"name": "e5", "dimension": 4}, {"name": "d7", "dimension": 4},
+                {"name": "d8", "dimension": 3}]},
+        ]
+    }
+
+
+def _leaf_names(node) -> set[str]:
+    if node["type"] == "leaf":
+        return {node["name"]}
+    return _leaf_names(node["left"]) | _leaf_names(node["right"])
+
+
 def test_healthz():
     r = client.get("/healthz")
     assert r.status_code == 200
@@ -78,6 +106,62 @@ def test_smoke_four_tensor_cotree_classification():
         assert cut["evidence"]
     assert len(body["steps"]) == 3
     assert body["tree"]["type"] == "node"
+
+
+def test_smoke_unique_mandatory_root_cut_with_masked_side_peak():
+    r = client.post("/api/plan", json=masked_peak_network())
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # exact summary metrics and canonical tree
+    summary = body["summary"]
+    assert summary["peak_memory"] == 720
+    assert summary["total_multiplications"] == 8640
+    assert summary["num_cotrees"] == 1
+    assert summary["canonical"] == "((((T1)(T2))(T0))(T3))"
+
+    # canonical tree root splits the leaves into exactly {T0,T1,T2} | {T3}
+    assert body["tree"]["type"] == "node"
+    assert _leaf_names(body["tree"]["left"]) == {"T0", "T1", "T2"}
+    assert _leaf_names(body["tree"]["right"]) == {"T3"}
+
+    # last contraction step merges that subtree with T3
+    assert len(body["steps"]) == 3
+    final = body["steps"][-1]
+    assert {tuple(sorted(final["left"])), tuple(sorted(final["right"]))} == {
+        ("T0", "T1", "T2"),
+        ("T3",),
+    }
+
+    by_class = {"mandatory": [], "optional": [], "absent": []}
+    for cut in body["cuts"]:
+        by_class[cut["classification"]].append(cut)
+
+    # exactly one mandatory cut — the canonical root cut — and six absent
+    assert len(by_class["mandatory"]) == 1
+    assert len(by_class["optional"]) == 0
+    assert len(by_class["absent"]) == 6
+
+    mandatory = by_class["mandatory"][0]
+    assert {tuple(mandatory["left"]), tuple(mandatory["right"])} == {
+        ("T0", "T1", "T2"),
+        ("T3",),
+    }
+    # evidence states it reaches peak 720 and total 8640, and is unique
+    assert "720" in mandatory["evidence"]
+    assert "8640" in mandatory["evidence"]
+    assert mandatory["optimal_root_cuts"] == 1
+
+    # no absent evidence may contradict the response's own canonical tree:
+    # its root cut is not among the absent cuts
+    absent_pairs = [
+        (tuple(c["left"]), tuple(c["right"])) for c in by_class["absent"]
+    ]
+    assert (("T0", "T1", "T2"), ("T3",)) not in absent_pairs
+    assert (("T3",), ("T0", "T1", "T2")) not in absent_pairs
+    for cut in by_class["absent"]:
+        assert cut["evidence"]
+        assert cut["optimal_root_cuts"] == 1
 
 
 def test_smoke_index_occurring_three_times_is_422_and_located():
